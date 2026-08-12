@@ -71,6 +71,12 @@ struct recv_thread_args {
 	int index;
 };
 
+struct nbd_read_range {
+	struct list_head list;
+	sector_t start;
+	sector_t end;
+};
+
 struct link_dead_args {
 	struct work_struct work;
 	int index;
@@ -126,8 +132,12 @@ struct nbd_device {
 	unsigned long flags;
 	unsigned int max_cache_kb;
 	u64 sequential_read_bytes;
-	sector_t last_read_end;
 	bool adaptive_read_enabled;
+	struct work_struct adaptive_read_work;
+	spinlock_t adaptive_read_lock;
+	struct list_head read_ranges;
+	sector_t read_stream_start;
+	bool read_stream_valid;
 };
 
 #define NBD_CMD_REQUEUED	1
@@ -208,31 +218,90 @@ static void apply_max_cache_kb(struct nbd_device *nbd, unsigned int value)
 
 static void nbd_reset_adaptive_read(struct nbd_device *nbd)
 {
+	struct nbd_read_range *range, *tmp;
+
+	spin_lock(&nbd->adaptive_read_lock);
+	list_for_each_entry_safe(range, tmp, &nbd->read_ranges, list) {
+		list_del(&range->list);
+		kfree(range);
+	}
 	nbd->sequential_read_bytes = 0;
-	nbd->last_read_end = 0;
 	nbd->adaptive_read_enabled = false;
+	nbd->read_stream_valid = false;
+	spin_unlock(&nbd->adaptive_read_lock);
+}
+
+static void nbd_enable_adaptive_read_work(struct work_struct *work)
+{
+	struct nbd_device *nbd = container_of(work, struct nbd_device,
+						      adaptive_read_work);
+
+	blk_mq_freeze_queue(nbd->disk->queue);
+	apply_max_cache_kb(nbd, max_cache_kb);
+	blk_mq_unfreeze_queue(nbd->disk->queue);
 }
 
 static void nbd_track_read(struct nbd_device *nbd, struct request *req)
 {
 	sector_t start = blk_rq_pos(req);
+	sector_t end = start + (blk_rq_bytes(req) >> SECTOR_SHIFT);
+	struct nbd_read_range *range, *cur, *tmp;
 	u64 threshold = (u64)adaptive_read_threshold_kb << 10;
-	u64 bytes = blk_rq_bytes(req);
 
 	if (req_op(req) != REQ_OP_READ || !threshold) {
 		nbd_reset_adaptive_read(nbd);
 		return;
 	}
-	if (nbd->sequential_read_bytes && start != nbd->last_read_end)
-		nbd_reset_adaptive_read(nbd);
-	nbd->sequential_read_bytes = min_t(u64,
-		nbd->sequential_read_bytes + bytes, threshold);
-	nbd->last_read_end = start + (bytes >> SECTOR_SHIFT);
+	range = kmalloc(sizeof(*range), GFP_ATOMIC);
+	if (!range)
+		return;
+	range->start = start;
+	range->end = end;
+	INIT_LIST_HEAD(&range->list);
+	spin_lock(&nbd->adaptive_read_lock);
+	if (!nbd->read_stream_valid) {
+		nbd->read_stream_start = start;
+		nbd->read_stream_valid = true;
+	}
+	list_for_each_entry_safe(cur, tmp, &nbd->read_ranges, list) {
+		if (range->end < cur->start || range->start > cur->end)
+			continue;
+		range->start = min(range->start, cur->start);
+		range->end = max(range->end, cur->end);
+		list_del(&cur->list);
+		kfree(cur);
+	}
+	/* Keep ranges ordered so the contiguous prefix can be scanned reliably. */
+	list_for_each_entry(cur, &nbd->read_ranges, list) {
+		if (range->start < cur->start) {
+			list_add_tail(&range->list, &cur->list);
+			goto range_added;
+		}
+	}
+	list_add_tail(&range->list, &nbd->read_ranges);
+range_added:
+	/* Find the contiguous prefix beginning at read_stream_start. */
+	{
+		sector_t contiguous_end = nbd->read_stream_start;
+	list_for_each_entry(cur, &nbd->read_ranges, list) {
+		if (cur->start > contiguous_end)
+			continue;
+		if (cur->end > contiguous_end)
+			contiguous_end = cur->end;
+	}
+	if (contiguous_end > nbd->read_stream_start)
+		nbd->sequential_read_bytes = min_t(u64,
+			(sector_t)(contiguous_end - nbd->read_stream_start) << 9,
+			threshold);
+	}
 	if (nbd->sequential_read_bytes >= threshold &&
 	    !nbd->adaptive_read_enabled) {
 		nbd->adaptive_read_enabled = true;
-		apply_max_cache_kb(nbd, max_cache_kb);
+		schedule_work(&nbd->adaptive_read_work);
 	}
+	spin_unlock(&nbd->adaptive_read_lock);
+	if (nbd->adaptive_read_enabled)
+		nbd_reset_adaptive_read(nbd);
 }
 
 static ssize_t max_cache_kb_show(struct device *dev,
@@ -1832,6 +1901,9 @@ static int nbd_dev_add(int index)
 		BLK_MQ_F_BLOCKING;
 	nbd->tag_set.driver_data = nbd;
 	nbd->destroy_complete = NULL;
+	spin_lock_init(&nbd->adaptive_read_lock);
+	INIT_LIST_HEAD(&nbd->read_ranges);
+	INIT_WORK(&nbd->adaptive_read_work, nbd_enable_adaptive_read_work);
 
 	err = blk_mq_alloc_tag_set(&nbd->tag_set);
 	if (err)
@@ -1855,6 +1927,7 @@ static int nbd_dev_add(int index)
 	blk_queue_max_segment_size(disk->queue, UINT_MAX);
 	blk_queue_max_segments(disk->queue, USHRT_MAX);
 	apply_max_cache_kb(nbd, 128);
+	nbd->max_cache_kb = max_cache_kb;
 
 	mutex_init(&nbd->config_lock);
 	refcount_set(&nbd->config_refs, 0);
@@ -1868,6 +1941,7 @@ static int nbd_dev_add(int index)
 	add_disk(disk);
 	/* add_disk() initializes the BDI and restores its default ra_pages. */
 	apply_max_cache_kb(nbd, 128);
+	nbd->max_cache_kb = max_cache_kb;
 	err = device_create_file(disk_to_dev(disk), &dev_attr_max_cache_kb);
 	if (err)
 		goto out_del_disk;
