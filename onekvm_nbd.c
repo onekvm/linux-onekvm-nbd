@@ -125,6 +125,9 @@ struct nbd_device {
 	struct completion *destroy_complete;
 	unsigned long flags;
 	unsigned int max_cache_kb;
+	u64 sequential_read_bytes;
+	sector_t last_read_end;
+	bool adaptive_read_enabled;
 };
 
 #define NBD_CMD_REQUEUED	1
@@ -153,7 +156,8 @@ static struct dentry *nbd_dbg_dir;
 static unsigned int nbds_max = 1;
 static int max_part;
 static unsigned int max_cache_kb = 1024;
-static unsigned int io_depth = 128;
+static unsigned int io_depth = 32;
+static unsigned int adaptive_read_threshold_kb = 16384;
 static int part_shift;
 static int nbd_major;
 
@@ -200,6 +204,35 @@ static void apply_max_cache_kb(struct nbd_device *nbd, unsigned int value)
 	q->limits.max_sectors = sectors;
 	q->backing_dev_info->ra_pages = (value << 10) / PAGE_SIZE;
 	nbd->max_cache_kb = value;
+}
+
+static void nbd_reset_adaptive_read(struct nbd_device *nbd)
+{
+	nbd->sequential_read_bytes = 0;
+	nbd->last_read_end = 0;
+	nbd->adaptive_read_enabled = false;
+}
+
+static void nbd_track_read(struct nbd_device *nbd, struct request *req)
+{
+	sector_t start = blk_rq_pos(req);
+	u64 threshold = (u64)adaptive_read_threshold_kb << 10;
+	u64 bytes = blk_rq_bytes(req);
+
+	if (req_op(req) != REQ_OP_READ || !threshold) {
+		nbd_reset_adaptive_read(nbd);
+		return;
+	}
+	if (nbd->sequential_read_bytes && start != nbd->last_read_end)
+		nbd_reset_adaptive_read(nbd);
+	nbd->sequential_read_bytes = min_t(u64,
+		nbd->sequential_read_bytes + bytes, threshold);
+	nbd->last_read_end = start + (bytes >> SECTOR_SHIFT);
+	if (nbd->sequential_read_bytes >= threshold &&
+	    !nbd->adaptive_read_enabled) {
+		nbd->adaptive_read_enabled = true;
+		apply_max_cache_kb(nbd, max_cache_kb);
+	}
 }
 
 static ssize_t max_cache_kb_show(struct device *dev,
@@ -1050,6 +1083,7 @@ static blk_status_t nbd_queue_rq(struct blk_mq_hw_ctx *hctx,
 	 */
 	mutex_lock(&cmd->lock);
 	clear_bit(NBD_CMD_REQUEUED, &cmd->flags);
+	nbd_track_read(cmd->nbd, bd->rq);
 
 	/* We can be called directly from the user space process, which means we
 	 * could possibly have signals pending so our sendmsg will fail.  In
@@ -1280,6 +1314,7 @@ static void nbd_config_put(struct nbd_device *nbd)
 					&nbd->config_lock)) {
 		struct nbd_config *config = nbd->config;
 		nbd_dev_dbg_close(nbd);
+		nbd_reset_adaptive_read(nbd);
 		nbd_size_clear(nbd);
 		if (test_and_clear_bit(NBD_RT_HAS_PID_FILE,
 				       &config->runtime_flags))
@@ -1819,7 +1854,7 @@ static int nbd_dev_add(int index)
 	blk_queue_max_discard_sectors(disk->queue, 0);
 	blk_queue_max_segment_size(disk->queue, UINT_MAX);
 	blk_queue_max_segments(disk->queue, USHRT_MAX);
-	apply_max_cache_kb(nbd, max_cache_kb);
+	apply_max_cache_kb(nbd, 128);
 
 	mutex_init(&nbd->config_lock);
 	refcount_set(&nbd->config_refs, 0);
@@ -1832,7 +1867,7 @@ static int nbd_dev_add(int index)
 	sprintf(disk->disk_name, "onekvm-nbd%d", index);
 	add_disk(disk);
 	/* add_disk() initializes the BDI and restores its default ra_pages. */
-	apply_max_cache_kb(nbd, max_cache_kb);
+	apply_max_cache_kb(nbd, 128);
 	err = device_create_file(disk_to_dev(disk), &dev_attr_max_cache_kb);
 	if (err)
 		goto out_del_disk;
@@ -2566,4 +2601,6 @@ MODULE_PARM_DESC(max_part, "number of partitions per device (default: 0)");
 module_param(max_cache_kb, uint, 0444);
 MODULE_PARM_DESC(max_cache_kb, "adaptive read cache ceiling in KiB (128, 256, 512, 1024, 2048, or 4096)");
 module_param(io_depth, uint, 0444);
-MODULE_PARM_DESC(io_depth, "maximum number of in-flight NBD requests per device (1-1024, default: 128)");
+MODULE_PARM_DESC(io_depth, "maximum number of in-flight NBD requests per device (1-1024, default: 32)");
+module_param(adaptive_read_threshold_kb, uint, 0644);
+MODULE_PARM_DESC(adaptive_read_threshold_kb, "sequential read amount before adaptive caching is enabled (KiB, default: 16384)");

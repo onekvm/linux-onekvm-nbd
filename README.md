@@ -25,9 +25,11 @@ OneKVM-specific changes:
   power-of-two values) and exposes it through the device's sysfs attribute.
   Changing it updates the request queue and read-ahead settings safely while
   the queue is frozen.
-- It exposes `io_depth` (1--1024, default 128) to control the number of
+- It exposes `io_depth` (1--1024, default 32) to control the number of
   requests that may be in flight per device, allowing userspace to select a
   suitable amount of request-level asynchronous I/O.
+- Adaptive read-ahead starts conservatively and is enabled after
+  `adaptive_read_threshold_kb` contiguous read data (default 16384 KiB).
 - Receive workqueues are unbound and lowered to the lowest normal priority,
   preventing NBD network processing from competing with latency-sensitive
   video/input work.
