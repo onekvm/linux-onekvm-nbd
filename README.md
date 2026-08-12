@@ -1,5 +1,7 @@
 # linux-onekvm-nbd
 
+English | [简体中文](README.zh-CN.md)
+
 OneKVM's optimized network block device client for browser-backed virtual
 media. It is a general Linux block-driver optimization and can be built for
 any compatible Linux 5.10 target.

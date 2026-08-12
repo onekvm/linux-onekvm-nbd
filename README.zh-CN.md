@@ -1,5 +1,7 @@
 # linux-onekvm-nbd
 
+[English](README.md) | 简体中文
+
 OneKVM 面向浏览器虚拟介质的通用优化版网络块设备（NBD）客户端。
 
 本驱动是针对虚拟介质访问路径的 Linux 块设备优化，可以为任何兼容 Linux
