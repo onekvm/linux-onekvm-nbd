@@ -1,10 +1,9 @@
 # linux-onekvm-nbd
 
-OneKVM 面向浏览器虚拟介质的优化版网络块设备（NBD）客户端。
+OneKVM 面向浏览器虚拟介质的通用优化版网络块设备（NBD）客户端。
 
-本驱动不是 SG2002 硬件专用，而是 OneKVM 针对虚拟介质访问路径做的 Linux
-块设备优化。在 SG2002 NanoKVM 上使用，也可以为其他兼容 Linux 5.10 的目标
-平台编译。
+本驱动是针对虚拟介质访问路径的 Linux 块设备优化，可以为任何兼容 Linux
+5.10 的目标平台编译。
 
 这是一个 Linux 5.10 树外内核模块。它保留 Linux NBD 标准 ioctl 和 netlink
 协议，同时使用独立的 `onekvm_nbd` 设备名和 generic-netlink family 名称，
@@ -18,8 +17,8 @@ OneKVM 面向浏览器虚拟介质的优化版网络块设备（NBD）客户端�
   major，也不使用 `nbd0` 名称。
 - generic-netlink family 和 multicast group 分别使用 `onekvm_nbd`、
   `onekvm_nbd_mc`，避免和原版 `nbd` family 冲突。
-- 默认只创建一个设备且不创建分区 minor，匹配 NanoKVM 单个浏览器虚拟介质
-  会话的使用方式。
+- 默认只创建一个设备且不创建分区 minor，匹配单个浏览器虚拟介质会话的使用
+  方式。
 - 增加自适应读缓存上限 `max_cache_kb`，支持 128--4096 KiB 的 2 的幂值，
   并通过设备 sysfs 属性提供运行时调整。修改时会先冻结 request queue，
   同步更新队列限制和 read-ahead 参数。
@@ -49,7 +48,7 @@ make -C /path/to/linux \
 
 内核必须导出本模块使用的 workqueue 属性辅助函数：
 `alloc_workqueue_attrs`、`apply_workqueue_attrs` 和 `free_workqueue_attrs`。
-OneKVM NanoKVM 内核的本地补丁集中包含这些导出符号。
+目标内核需要通过上游代码或平台内核补丁提供这些导出符号。
 
 ## 许可证
 

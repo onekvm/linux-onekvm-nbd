@@ -1,9 +1,8 @@
 # linux-onekvm-nbd
 
 OneKVM's optimized network block device client for browser-backed virtual
-media. This driver is not SG2002 hardware-specific; it is a Linux block
-driver optimization used by OneKVM on SG2002 NanoKVM systems and can be
-built for any compatible Linux 5.10 target.
+media. It is a general Linux block-driver optimization and can be built for
+any compatible Linux 5.10 target.
 
 This is an out-of-tree Linux 5.10 kernel module. It keeps the standard Linux
 NBD ioctl and netlink wire/userspace protocol, but uses the separate
@@ -19,8 +18,8 @@ OneKVM-specific changes:
   instead of claiming the upstream `nbd` major and `nbd0` name.
 - The generic-netlink family and multicast group are named `onekvm_nbd` and
   `onekvm_nbd_mc`, avoiding collisions with the upstream `nbd` family.
-- It defaults to one device with no partition minors, matching the single
-  browser-backed virtual-media session used by NanoKVM.
+- It defaults to one device with no partition minors, matching a single
+  browser-backed virtual-media session.
 - It adds an adaptive read-cache ceiling (`max_cache_kb`, 128--4096 KiB,
   power-of-two values) and exposes it through the device's sysfs attribute.
   Changing it updates the request queue and read-ahead settings safely while
@@ -50,7 +49,8 @@ make -C /path/to/linux \
 
 The kernel must export the workqueue attribute helpers used by this module:
 `alloc_workqueue_attrs`, `apply_workqueue_attrs`, and `free_workqueue_attrs`.
-OneKVM's NanoKVM kernel carries those exports in its local kernel patch set.
+The target kernel must provide these exports, either upstream or through a
+small platform kernel patch.
 
 ## License
 
