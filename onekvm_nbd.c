@@ -153,6 +153,7 @@ static struct dentry *nbd_dbg_dir;
 static unsigned int nbds_max = 1;
 static int max_part;
 static unsigned int max_cache_kb = 1024;
+static unsigned int io_depth = 128;
 static int part_shift;
 static int nbd_major;
 
@@ -1789,7 +1790,7 @@ static int nbd_dev_add(int index)
 	nbd->disk = disk;
 	nbd->tag_set.ops = &nbd_mq_ops;
 	nbd->tag_set.nr_hw_queues = 1;
-	nbd->tag_set.queue_depth = 128;
+	nbd->tag_set.queue_depth = io_depth;
 	nbd->tag_set.numa_node = NUMA_NO_NODE;
 	nbd->tag_set.cmd_size = sizeof(struct nbd_cmd);
 	nbd->tag_set.flags = BLK_MQ_F_SHOULD_MERGE |
@@ -2471,6 +2472,10 @@ static int __init nbd_init(void)
 		pr_err("onekvm_nbd: max_cache_kb must be a power of two from 128 to 4096\n");
 		return -EINVAL;
 	}
+	if (io_depth < 1 || io_depth > 1024) {
+		pr_err("onekvm_nbd: io_depth must be between 1 and 1024\n");
+		return -EINVAL;
+	}
 
 	if (max_part < 0) {
 		printk(KERN_ERR "nbd: max_part must be >= 0\n");
@@ -2560,3 +2565,5 @@ module_param(max_part, int, 0444);
 MODULE_PARM_DESC(max_part, "number of partitions per device (default: 0)");
 module_param(max_cache_kb, uint, 0444);
 MODULE_PARM_DESC(max_cache_kb, "adaptive read cache ceiling in KiB (128, 256, 512, 1024, 2048, or 4096)");
+module_param(io_depth, uint, 0444);
+MODULE_PARM_DESC(io_depth, "maximum number of in-flight NBD requests per device (1-1024, default: 128)");
