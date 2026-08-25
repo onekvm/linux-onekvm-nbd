@@ -179,22 +179,6 @@ static int nbd_genl_status(struct sk_buff *skb, struct genl_info *info);
 static void nbd_dead_link_work(struct work_struct *work);
 static void nbd_disconnect_and_put(struct nbd_device *nbd);
 
-static int nbd_set_recv_workqueue_nice(struct workqueue_struct *workq)
-{
-	struct workqueue_attrs *attrs;
-	int error;
-
-	attrs = alloc_workqueue_attrs();
-	if (!attrs)
-		return -ENOMEM;
-	attrs->nice = MAX_NICE;
-	get_online_cpus();
-	error = apply_workqueue_attrs(workq, attrs);
-	put_online_cpus();
-	free_workqueue_attrs(attrs);
-	return error;
-}
-
 static inline struct device *nbd_to_dev(struct nbd_device *nbd)
 {
 	return disk_to_dev(nbd->disk);
@@ -205,15 +189,22 @@ static bool valid_max_cache_kb(unsigned int value)
 	return value >= 128 && value <= 4096 && is_power_of_2(value);
 }
 
-static void apply_max_cache_kb(struct nbd_device *nbd, unsigned int value)
+static int apply_max_cache_kb(struct nbd_device *nbd, unsigned int value)
 {
 	struct request_queue *q = nbd->disk->queue;
+	struct queue_limits lim;
 	unsigned int sectors = value << 1;
+	int error;
 
-	blk_queue_max_hw_sectors(q, sectors);
-	q->limits.max_sectors = sectors;
-	q->backing_dev_info->ra_pages = (value << 10) / PAGE_SIZE;
+	lim = queue_limits_start_update(q);
+	lim.max_hw_sectors = sectors;
+	lim.max_user_sectors = sectors;
+	error = queue_limits_commit_update_frozen(q, &lim);
+	if (error)
+		return error;
+	nbd->disk->bdi->ra_pages = (value << 10) / PAGE_SIZE;
 	nbd->max_cache_kb = value;
+	return 0;
 }
 
 static void nbd_reset_adaptive_read(struct nbd_device *nbd)
@@ -236,9 +227,8 @@ static void nbd_enable_adaptive_read_work(struct work_struct *work)
 	struct nbd_device *nbd = container_of(work, struct nbd_device,
 						      adaptive_read_work);
 
-	blk_mq_freeze_queue(nbd->disk->queue);
-	apply_max_cache_kb(nbd, max_cache_kb);
-	blk_mq_unfreeze_queue(nbd->disk->queue);
+	if (apply_max_cache_kb(nbd, max_cache_kb))
+		dev_warn(nbd_to_dev(nbd), "failed to enable adaptive read cache\n");
 }
 
 static void nbd_track_read(struct nbd_device *nbd, struct request *req)
@@ -326,9 +316,9 @@ static ssize_t max_cache_kb_store(struct device *dev,
 	if (!valid_max_cache_kb(value))
 		return -EINVAL;
 
-	blk_mq_freeze_queue(nbd->disk->queue);
-	apply_max_cache_kb(nbd, value);
-	blk_mq_unfreeze_queue(nbd->disk->queue);
+	err = apply_max_cache_kb(nbd, value);
+	if (err)
+		return err;
 	return count;
 }
 static DEVICE_ATTR_RW(max_cache_kb);
@@ -391,16 +381,13 @@ static const struct device_attribute pid_attr = {
 static void nbd_dev_remove(struct nbd_device *nbd)
 {
 	struct gendisk *disk = nbd->disk;
-	struct request_queue *q;
 
 	if (disk) {
-		q = disk->queue;
 		device_remove_file(disk_to_dev(disk), &dev_attr_max_cache_kb);
 		del_gendisk(disk);
-		blk_cleanup_queue(q);
-		blk_mq_free_tag_set(&nbd->tag_set);
 		disk->private_data = NULL;
 		put_disk(disk);
+		blk_mq_free_tag_set(&nbd->tag_set);
 	}
 
 	/*
@@ -471,27 +458,39 @@ static void nbd_size_clear(struct nbd_device *nbd)
 static void nbd_size_update(struct nbd_device *nbd, bool start)
 {
 	struct nbd_config *config = nbd->config;
-	struct block_device *bdev = bdget_disk(nbd->disk, 0);
+	struct queue_limits lim;
 	sector_t nr_sectors = config->bytesize >> 9;
+	int error;
 
-	if (config->flags & NBD_FLAG_SEND_TRIM) {
-		nbd->disk->queue->limits.discard_granularity = config->blksize;
-		nbd->disk->queue->limits.discard_alignment = config->blksize;
-		blk_queue_max_discard_sectors(nbd->disk->queue, UINT_MAX);
+	lim = queue_limits_start_update(nbd->disk->queue);
+	if (config->flags & NBD_FLAG_SEND_TRIM)
+		lim.max_hw_discard_sectors = UINT_MAX >> SECTOR_SHIFT;
+	else
+		lim.max_hw_discard_sectors = 0;
+	if (!(config->flags & NBD_FLAG_SEND_FLUSH)) {
+		lim.features &= ~(BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA);
+	} else if (config->flags & NBD_FLAG_SEND_FUA) {
+		lim.features |= BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA;
+	} else {
+		lim.features |= BLK_FEAT_WRITE_CACHE;
+		lim.features &= ~BLK_FEAT_FUA;
 	}
-	blk_queue_logical_block_size(nbd->disk->queue, config->blksize);
-	blk_queue_physical_block_size(nbd->disk->queue, config->blksize);
-	set_capacity(nbd->disk, nr_sectors);
-	if (bdev) {
-		if (bdev->bd_disk) {
-			bd_set_nr_sectors(bdev, nr_sectors);
-			if (start)
-				set_blocksize(bdev, config->blksize);
-		} else
-			set_bit(GD_NEED_PART_SCAN, &nbd->disk->state);
-		bdput(bdev);
+	if (config->flags & NBD_FLAG_ROTATIONAL)
+		lim.features |= BLK_FEAT_ROTATIONAL;
+	if (config->flags & NBD_FLAG_SEND_WRITE_ZEROES)
+		lim.max_write_zeroes_sectors = UINT_MAX >> SECTOR_SHIFT;
+	lim.logical_block_size = config->blksize;
+	lim.physical_block_size = config->blksize;
+	error = queue_limits_commit_update_frozen(nbd->disk->queue, &lim);
+	if (error) {
+		dev_err(nbd_to_dev(nbd), "failed to update queue limits: %d\n",
+			error);
+		return;
 	}
-	kobject_uevent(&nbd_to_dev(nbd)->kobj, KOBJ_CHANGE);
+	if (max_part)
+		set_bit(GD_NEED_PART_SCAN, &nbd->disk->state);
+	if (!set_capacity_and_notify(nbd->disk, nr_sectors))
+		kobject_uevent(&nbd_to_dev(nbd)->kobj, KOBJ_CHANGE);
 }
 
 static void nbd_size_set(struct nbd_device *nbd, loff_t blocksize,
@@ -552,8 +551,7 @@ static u32 req_to_nbd_cmd_type(struct request *req)
 	}
 }
 
-static enum blk_eh_timer_return nbd_xmit_timeout(struct request *req,
-						 bool reserved)
+static enum blk_eh_timer_return nbd_xmit_timeout(struct request *req)
 {
 	struct nbd_cmd *cmd = blk_mq_rq_to_pdu(req);
 	struct nbd_device *nbd = cmd->nbd;
@@ -981,7 +979,7 @@ static void recv_work(struct work_struct *work)
 	kfree(args);
 }
 
-static bool nbd_clear_req(struct request *req, void *data, bool reserved)
+static bool nbd_clear_req(struct request *req, void *data)
 {
 	struct nbd_cmd *cmd = blk_mq_rq_to_pdu(req);
 
@@ -1309,30 +1307,21 @@ static int nbd_reconnect_socket(struct nbd_device *nbd, unsigned long arg)
 	return -ENOSPC;
 }
 
-static void nbd_bdev_reset(struct block_device *bdev)
+static void nbd_bdev_reset(struct nbd_device *nbd)
 {
-	if (bdev->bd_openers > 1)
+	if (disk_openers(nbd->disk) > 1)
 		return;
-	bd_set_nr_sectors(bdev, 0);
+	set_capacity(nbd->disk, 0);
 }
 
 static void nbd_parse_flags(struct nbd_device *nbd)
 {
 	struct nbd_config *config = nbd->config;
+
 	if (config->flags & NBD_FLAG_READ_ONLY)
 		set_disk_ro(nbd->disk, true);
 	else
 		set_disk_ro(nbd->disk, false);
-	if (config->flags & NBD_FLAG_SEND_TRIM)
-		blk_queue_flag_set(QUEUE_FLAG_DISCARD, nbd->disk->queue);
-	if (config->flags & NBD_FLAG_SEND_FLUSH) {
-		if (config->flags & NBD_FLAG_SEND_FUA)
-			blk_queue_write_cache(nbd->disk->queue, true, true);
-		else
-			blk_queue_write_cache(nbd->disk->queue, true, false);
-	}
-	else
-		blk_queue_write_cache(nbd->disk->queue, false, false);
 }
 
 static void send_disconnects(struct nbd_device *nbd)
@@ -1406,11 +1395,6 @@ static void nbd_config_put(struct nbd_device *nbd)
 		nbd->recv_workq = NULL;
 
 		nbd->tag_set.timeout = 0;
-		nbd->disk->queue->limits.discard_granularity = 0;
-		nbd->disk->queue->limits.discard_alignment = 0;
-		blk_queue_max_discard_sectors(nbd->disk->queue, UINT_MAX);
-		blk_queue_flag_clear(QUEUE_FLAG_DISCARD, nbd->disk->queue);
-
 		mutex_unlock(&nbd->config_lock);
 		nbd_put(nbd);
 		module_put(THIS_MODULE);
@@ -1440,16 +1424,6 @@ static int nbd_start_device(struct nbd_device *nbd)
 		dev_err(disk_to_dev(nbd->disk), "Could not allocate knbd recv work queue.\n");
 		return -ENOMEM;
 	}
-	error = nbd_set_recv_workqueue_nice(nbd->recv_workq);
-	if (error) {
-		dev_err(disk_to_dev(nbd->disk),
-			"Could not lower knbd recv work queue priority: %d.\n",
-			error);
-		destroy_workqueue(nbd->recv_workq);
-		nbd->recv_workq = NULL;
-		return error;
-	}
-
 	blk_mq_update_nr_hw_queues(&nbd->tag_set, config->num_connections);
 	nbd->task_recv = current;
 
@@ -1515,7 +1489,7 @@ static int nbd_start_device_ioctl(struct nbd_device *nbd, struct block_device *b
 	flush_workqueue(nbd->recv_workq);
 
 	mutex_lock(&nbd->config_lock);
-	nbd_bdev_reset(bdev);
+	nbd_bdev_reset(nbd);
 	/* user requested, ignore socket errors */
 	if (test_bit(NBD_RT_DISCONNECT_REQUESTED, &config->runtime_flags))
 		ret = 0;
@@ -1528,8 +1502,8 @@ static void nbd_clear_sock_ioctl(struct nbd_device *nbd,
 				 struct block_device *bdev)
 {
 	sock_shutdown(nbd);
-	__invalidate_device(bdev, true);
-	nbd_bdev_reset(bdev);
+	invalidate_disk(nbd->disk);
+	nbd_bdev_reset(nbd);
 	if (test_and_clear_bit(NBD_RT_HAS_CONFIG_REF,
 			       &nbd->config->runtime_flags))
 		nbd_config_put(nbd);
@@ -1652,13 +1626,13 @@ static struct nbd_config *nbd_alloc_config(void)
 	return config;
 }
 
-static int nbd_open(struct block_device *bdev, fmode_t mode)
+static int nbd_open(struct gendisk *disk, blk_mode_t mode)
 {
 	struct nbd_device *nbd;
 	int ret = 0;
 
 	mutex_lock(&nbd_index_mutex);
-	nbd = bdev->bd_disk->private_data;
+	nbd = disk->private_data;
 	if (!nbd) {
 		ret = -ENXIO;
 		goto out;
@@ -1684,24 +1658,24 @@ static int nbd_open(struct block_device *bdev, fmode_t mode)
 		refcount_set(&nbd->config_refs, 1);
 		refcount_inc(&nbd->refs);
 		mutex_unlock(&nbd->config_lock);
-		set_bit(GD_NEED_PART_SCAN, &bdev->bd_disk->state);
+		if (max_part)
+			set_bit(GD_NEED_PART_SCAN, &disk->state);
 	} else if (nbd_disconnected(nbd->config)) {
-		set_bit(GD_NEED_PART_SCAN, &bdev->bd_disk->state);
+		if (max_part)
+			set_bit(GD_NEED_PART_SCAN, &disk->state);
 	}
 out:
 	mutex_unlock(&nbd_index_mutex);
 	return ret;
 }
 
-static void nbd_release(struct gendisk *disk, fmode_t mode)
+static void nbd_release(struct gendisk *disk)
 {
 	struct nbd_device *nbd = disk->private_data;
-	struct block_device *bdev = bdget_disk(disk, 0);
 
 	if (test_bit(NBD_RT_DISCONNECT_ON_CLOSE, &nbd->config->runtime_flags) &&
-			bdev->bd_openers == 0)
+			disk_openers(disk) == 0)
 		nbd_disconnect_and_put(nbd);
-	bdput(bdev);
 
 	nbd_config_put(nbd);
 	nbd_put(nbd);
@@ -1864,18 +1838,19 @@ static const struct blk_mq_ops nbd_mq_ops = {
 
 static int nbd_dev_add(int index)
 {
+	struct queue_limits lim = {
+		.max_hw_sectors = 128 << 1,
+		.max_user_sectors = 128 << 1,
+		.max_segments = USHRT_MAX,
+		.max_segment_size = UINT_MAX,
+	};
 	struct nbd_device *nbd;
 	struct gendisk *disk;
-	struct request_queue *q;
 	int err = -ENOMEM;
 
 	nbd = kzalloc(sizeof(struct nbd_device), GFP_KERNEL);
 	if (!nbd)
 		goto out;
-
-	disk = alloc_disk(1 << part_shift);
-	if (!disk)
-		goto out_free_nbd;
 
 	if (index >= 0) {
 		err = idr_alloc(&nbd_index_idr, nbd, index, index + 1,
@@ -1888,17 +1863,15 @@ static int nbd_dev_add(int index)
 			index = err;
 	}
 	if (err < 0)
-		goto out_free_disk;
+		goto out_free_nbd;
 
 	nbd->index = index;
-	nbd->disk = disk;
 	nbd->tag_set.ops = &nbd_mq_ops;
 	nbd->tag_set.nr_hw_queues = 1;
 	nbd->tag_set.queue_depth = io_depth;
 	nbd->tag_set.numa_node = NUMA_NO_NODE;
 	nbd->tag_set.cmd_size = sizeof(struct nbd_cmd);
-	nbd->tag_set.flags = BLK_MQ_F_SHOULD_MERGE |
-		BLK_MQ_F_BLOCKING;
+	nbd->tag_set.flags = BLK_MQ_F_BLOCKING;
 	nbd->tag_set.driver_data = nbd;
 	nbd->destroy_complete = NULL;
 	spin_lock_init(&nbd->adaptive_read_lock);
@@ -1909,25 +1882,12 @@ static int nbd_dev_add(int index)
 	if (err)
 		goto out_free_idr;
 
-	q = blk_mq_init_queue(&nbd->tag_set);
-	if (IS_ERR(q)) {
-		err = PTR_ERR(q);
+	disk = blk_mq_alloc_disk(&nbd->tag_set, &lim, NULL);
+	if (IS_ERR(disk)) {
+		err = PTR_ERR(disk);
 		goto out_free_tags;
 	}
-	disk->queue = q;
-
-	/*
-	 * Tell the block layer that we are not a rotational device
-	 */
-	blk_queue_flag_set(QUEUE_FLAG_NONROT, disk->queue);
-	blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, disk->queue);
-	disk->queue->limits.discard_granularity = 0;
-	disk->queue->limits.discard_alignment = 0;
-	blk_queue_max_discard_sectors(disk->queue, 0);
-	blk_queue_max_segment_size(disk->queue, UINT_MAX);
-	blk_queue_max_segments(disk->queue, USHRT_MAX);
-	apply_max_cache_kb(nbd, 128);
-	nbd->max_cache_kb = max_cache_kb;
+	nbd->disk = disk;
 
 	mutex_init(&nbd->config_lock);
 	refcount_set(&nbd->config_refs, 0);
@@ -1935,12 +1895,17 @@ static int nbd_dev_add(int index)
 	INIT_LIST_HEAD(&nbd->list);
 	disk->major = nbd_major;
 	disk->first_minor = index << part_shift;
+	disk->minors = 1 << part_shift;
 	disk->fops = &nbd_fops;
 	disk->private_data = nbd;
 	sprintf(disk->disk_name, "onekvm-nbd%d", index);
-	add_disk(disk);
+	err = add_disk(disk);
+	if (err)
+		goto out_put_disk;
 	/* add_disk() initializes the BDI and restores its default ra_pages. */
-	apply_max_cache_kb(nbd, 128);
+	err = apply_max_cache_kb(nbd, 128);
+	if (err)
+		goto out_del_disk;
 	nbd->max_cache_kb = max_cache_kb;
 	err = device_create_file(disk_to_dev(disk), &dev_attr_max_cache_kb);
 	if (err)
@@ -1950,10 +1915,10 @@ static int nbd_dev_add(int index)
 
 out_del_disk:
 	del_gendisk(disk);
-	blk_cleanup_queue(q);
+out_put_disk:
+	put_disk(disk);
 	blk_mq_free_tag_set(&nbd->tag_set);
 	idr_remove(&nbd_index_idr, index);
-	put_disk(disk);
 	kfree(nbd);
 	return err;
 
@@ -1961,8 +1926,6 @@ out_free_tags:
 	blk_mq_free_tag_set(&nbd->tag_set);
 out_free_idr:
 	idr_remove(&nbd_index_idr, index);
-out_free_disk:
-	put_disk(disk);
 out_free_nbd:
 	kfree(nbd);
 out:
@@ -2421,6 +2384,7 @@ static struct genl_family nbd_genl_family __ro_after_init = {
 	.module		= THIS_MODULE,
 	.small_ops	= nbd_connect_genl_ops,
 	.n_small_ops	= ARRAY_SIZE(nbd_connect_genl_ops),
+	.resv_start_op	= NBD_CMD_STATUS + 1,
 	.maxattr	= NBD_ATTR_MAX,
 	.policy = nbd_attr_policy,
 	.mcgrps		= nbd_mcast_grps,
