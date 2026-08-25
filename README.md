@@ -3,17 +3,20 @@
 English | [简体中文](README.zh-CN.md)
 
 OneKVM's optimized network block device client for browser-backed virtual
-media. It is a general Linux block-driver optimization and can be built for
-any compatible Linux 5.10 target.
+media.
 
-This is an out-of-tree Linux 5.10 kernel module. It keeps the standard Linux
-NBD ioctl and netlink wire/userspace protocol, but uses the separate
-`onekvm_nbd` device and generic-netlink family names so it can coexist with
-the upstream `nbd` driver.
+Sources are split by kernel series under `5.10/` and `6.18/`. Linux 5.15 is
+not a symlink of 5.10: 5.10 still uses `alloc_disk()`, 5.15 uses
+`blk_mq_alloc_disk(set, queuedata)`, and 6.18 passes `queue_limits`.
+
+This is an out-of-tree kernel module. It keeps the standard Linux NBD ioctl
+and netlink wire/userspace protocol, but uses the separate `onekvm_nbd`
+device and generic-netlink family names so it can coexist with the upstream
+`nbd` driver.
 
 ## Differences from the upstream NBD driver
 
-The implementation is based on the Linux 5.10 NBD driver, with these
+Each tree starts from that series' in-tree NBD driver, with these
 OneKVM-specific changes:
 
 - The module registers a dynamic block major and exposes `/dev/onekvm-nbd0`
@@ -37,13 +40,19 @@ OneKVM-specific changes:
 - Debugfs state is placed below `onekvm_nbd` rather than `nbd`.
 
 The NBD protocol, request/reply format, ioctl ABI, and netlink attributes are
-otherwise intentionally kept compatible with Linux 5.10 NBD userspace.
+otherwise kept compatible with the matching kernel's NBD userspace.
 
 ## Build
 
 ```sh
 make -C /path/to/linux \
-    M="$PWD" \
+    M="$PWD/5.10" \
+    ARCH=riscv \
+    CROSS_COMPILE=riscv64-linux-gnu- \
+    modules
+
+make -C /path/to/linux \
+    M="$PWD/6.18" \
     ARCH=riscv \
     CROSS_COMPILE=riscv64-linux-gnu- \
     modules
@@ -56,4 +65,5 @@ small platform kernel patch.
 
 ## License
 
-GPL-2.0-or-later. See the SPDX identifier in `onekvm_nbd.c`.
+GPL-2.0-or-later. See the SPDX identifier in `5.10/onekvm_nbd.c` or
+`6.18/onekvm_nbd.c`.

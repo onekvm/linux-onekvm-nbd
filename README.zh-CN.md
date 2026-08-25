@@ -4,16 +4,17 @@
 
 OneKVM 面向浏览器虚拟介质的通用优化版网络块设备（NBD）客户端。
 
-本驱动是针对虚拟介质访问路径的 Linux 块设备优化，可以为任何兼容 Linux
-5.10 的目标平台编译。
+源码按内核系列放在 `5.10/` 和 `6.18/`。5.15 **不能**软链到 5.10：5.10 仍用
+`alloc_disk()`，5.15 是 `blk_mq_alloc_disk(set, queuedata)`，6.18 还要传
+`queue_limits`。
 
-这是一个 Linux 5.10 树外内核模块。它保留 Linux NBD 标准 ioctl 和 netlink
-协议，同时使用独立的 `onekvm_nbd` 设备名和 generic-netlink family 名称，
-因此可以和原版 `nbd` 驱动并存。
+这是树外内核模块。它保留 Linux NBD 标准 ioctl 和 netlink 协议，同时使用
+独立的 `onekvm_nbd` 设备名和 generic-netlink family 名称，因此可以和原版
+`nbd` 驱动并存。
 
 ## 与 Linux 原版 NBD 的区别
 
-本实现基于 Linux 5.10 的 NBD 驱动，增加了以下 OneKVM 优化：
+各目录从对应内核的 in-tree NBD 起步，增加了以下 OneKVM 优化：
 
 - 使用动态 block major，设备名为 `/dev/onekvm-nbd0`，不占用原版 `nbd`
   major，也不使用 `nbd0` 名称。
@@ -33,16 +34,20 @@ OneKVM 面向浏览器虚拟介质的通用优化版网络块设备（NBD）客�
   NBD 网络处理对视频和输入等低延迟任务的影响。
 - debugfs 状态放在 `onekvm_nbd` 目录下，而不是原版的 `nbd` 目录。
 
-NBD 的网络协议、request/reply 格式、ioctl ABI 和 netlink 属性保持与 Linux
-5.10 原版 userspace 的兼容性。
+NBD 的网络协议、request/reply 格式、ioctl ABI 和 netlink 属性与对应内核
+原版 userspace 保持兼容。
 
 ## 编译
 
-针对已经配置好的 Linux 内核树编译模块：
-
 ```sh
 make -C /path/to/linux \
-    M="$PWD" \
+    M="$PWD/5.10" \
+    ARCH=riscv \
+    CROSS_COMPILE=riscv64-linux-gnu- \
+    modules
+
+make -C /path/to/linux \
+    M="$PWD/6.18" \
     ARCH=riscv \
     CROSS_COMPILE=riscv64-linux-gnu- \
     modules
@@ -54,4 +59,5 @@ make -C /path/to/linux \
 
 ## 许可证
 
-GPL-2.0-or-later，详见 `onekvm_nbd.c` 中的 SPDX 标识。
+GPL-2.0-or-later，详见 `5.10/onekvm_nbd.c` 或 `6.18/onekvm_nbd.c` 中的 SPDX
+标识。
