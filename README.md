@@ -5,9 +5,9 @@ English | [简体中文](README.zh-CN.md)
 OneKVM's optimized network block device client for browser-backed virtual
 media.
 
-Sources are split by kernel series under `5.10/` and `6.18/`. Linux 5.15 is
-not a symlink of 5.10: 5.10 still uses `alloc_disk()`, 5.15 uses
-`blk_mq_alloc_disk(set, queuedata)`, and 6.18 passes `queue_limits`.
+Sources are split by kernel series under `5.10/`, `5.15/`, and `6.18/`.
+Linux 5.15 is not a symlink of 5.10: 5.10 still uses `alloc_disk()`, 5.15
+uses `blk_mq_alloc_disk(set, queuedata)`, and 6.18 passes `queue_limits`.
 
 This is an out-of-tree kernel module. It keeps the standard Linux NBD ioctl
 and netlink wire/userspace protocol, but uses the separate `onekvm_nbd`
@@ -52,6 +52,12 @@ make -C /path/to/linux \
     modules
 
 make -C /path/to/linux \
+    M="$PWD/5.15" \
+    ARCH=riscv \
+    CROSS_COMPILE=riscv64-linux-gnu- \
+    modules
+
+make -C /path/to/linux \
     M="$PWD/6.18" \
     ARCH=riscv \
     CROSS_COMPILE=riscv64-linux-gnu- \
@@ -65,5 +71,5 @@ small platform kernel patch.
 
 ## License
 
-GPL-2.0-or-later. See the SPDX identifier in `5.10/onekvm_nbd.c` or
-`6.18/onekvm_nbd.c`.
+GPL-2.0-or-later. See the SPDX identifier in `5.10/onekvm_nbd.c`,
+`5.15/onekvm_nbd.c`, or `6.18/onekvm_nbd.c`.

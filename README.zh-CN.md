@@ -4,9 +4,9 @@
 
 OneKVM 面向浏览器虚拟介质的通用优化版网络块设备（NBD）客户端。
 
-源码按内核系列放在 `5.10/` 和 `6.18/`。5.15 **不能**软链到 5.10：5.10 仍用
-`alloc_disk()`，5.15 是 `blk_mq_alloc_disk(set, queuedata)`，6.18 还要传
-`queue_limits`。
+源码按内核系列放在 `5.10/`、`5.15/` 和 `6.18/`。5.15 **不能**软链到 5.10：
+5.10 仍用 `alloc_disk()`，5.15 是 `blk_mq_alloc_disk(set, queuedata)`，6.18
+还要传 `queue_limits`。
 
 这是树外内核模块。它保留 Linux NBD 标准 ioctl 和 netlink 协议，同时使用
 独立的 `onekvm_nbd` 设备名和 generic-netlink family 名称，因此可以和原版
@@ -47,6 +47,12 @@ make -C /path/to/linux \
     modules
 
 make -C /path/to/linux \
+    M="$PWD/5.15" \
+    ARCH=riscv \
+    CROSS_COMPILE=riscv64-linux-gnu- \
+    modules
+
+make -C /path/to/linux \
     M="$PWD/6.18" \
     ARCH=riscv \
     CROSS_COMPILE=riscv64-linux-gnu- \
@@ -59,5 +65,5 @@ make -C /path/to/linux \
 
 ## 许可证
 
-GPL-2.0-or-later，详见 `5.10/onekvm_nbd.c` 或 `6.18/onekvm_nbd.c` 中的 SPDX
-标识。
+GPL-2.0-or-later，详见 `5.10/onekvm_nbd.c`、`5.15/onekvm_nbd.c` 或
+`6.18/onekvm_nbd.c` 中的 SPDX 标识。
