@@ -32,8 +32,13 @@ OneKVM-specific changes:
 - It exposes `io_depth` (1--1024, default 32) to control the number of
   requests that may be in flight per device, allowing userspace to select a
   suitable amount of request-level asynchronous I/O.
-- Adaptive read-ahead starts conservatively and is enabled after
-  `adaptive_read_threshold_kb` contiguous read data (default 16384 KiB).
+- Adaptive read starts at 128 KiB. A contiguous resume that fills the
+  current window doubles it, up to `max_cache_kb`. A read that does not
+  start at the previous end is a hole: the window and the resume point stay
+  put. If that end is not resumed within `adaptive_read_idle_ms` (default
+  2000), the window returns to 128 KiB. `adaptive_read_threshold_kb` is
+  ignored and kept so existing modprobe options still load. Disconnect
+  also returns the window to 128 KiB.
 - Receive workqueues are unbound and lowered to the lowest normal priority,
   preventing NBD network processing from competing with latency-sensitive
   video/input work.
